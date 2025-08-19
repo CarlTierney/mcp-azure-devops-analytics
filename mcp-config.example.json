@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "azure-devops-analytics": {
+      "command": "node",
+      "args": ["dist/index.js"],
+      "env": {
+        "AZURE_DEVOPS_ORG_URL": "https://dev.azure.com/your-organization",
+        "AZURE_DEVOPS_PAT": "your-personal-access-token",
+        "AZURE_DEVOPS_PROJECT": "your-project-name",
+        "MCP_ANALYTICS_CACHE_DIR": "/path/to/your/analytics/cache"
+      },
+      "description": "Azure DevOps Analytics MCP Server for Agile and DORA metrics"
+    }
+  }
+}
