@@ -20,13 +20,19 @@ interface TeamAnalytics {
 }
 
 async function generateImprovedAnalytics() {
+  const project = process.env.AZURE_DEVOPS_PROJECT;
+  if (!project) {
+    console.error('❌ Error: AZURE_DEVOPS_PROJECT environment variable is required');
+    process.exit(1);
+  }
+  
   const client = new AzureDevOpsClient({
     orgUrl: process.env.AZURE_DEVOPS_ORG_URL!,
     pat: process.env.AZURE_DEVOPS_PAT!,
-    project: 'Fidem'
+    project
   });
 
-  console.log('📊 Advanced Azure DevOps Analytics Report - Fidem Project\n');
+  console.log(`📊 Advanced Azure DevOps Analytics Report - ${project} Project\n`);
   console.log('=' .repeat(70));
   console.log('ASSUMPTION: Team names correspond to area paths\n');
   console.log('=' .repeat(70));
@@ -36,12 +42,12 @@ async function generateImprovedAnalytics() {
     console.log('\n⏳ Loading data...\n');
     
     const [areas, teams, users, allWorkItems] = await Promise.all([
-      client.getAreas('Fidem'),
-      client.getTeams('Fidem'),
-      client.getUsers('Fidem'),
+      client.getAreas(project),
+      client.getTeams(project),
+      client.getUsers(project),
       client.queryAnalytics(
         `WorkItemSnapshot?$select=WorkItemId,Title,WorkItemType,State,AssignedToUserSK,AreaSK,CreatedDateSK,ChangedDateSK,StoryPoints,Priority,Tags&$filter=Revision eq 1&$top=2000`,
-        'Fidem'
+        project
       )
     ]);
     

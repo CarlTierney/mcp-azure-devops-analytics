@@ -49,20 +49,26 @@ function calculateSimilarity(str1: string, str2: string): number {
 }
 
 async function analyzeTeamAreaMatching() {
+  const project = process.env.AZURE_DEVOPS_PROJECT;
+  if (!project) {
+    console.error('❌ Error: AZURE_DEVOPS_PROJECT environment variable is required');
+    process.exit(1);
+  }
+  
   const client = new AzureDevOpsClient({
     orgUrl: process.env.AZURE_DEVOPS_ORG_URL!,
     pat: process.env.AZURE_DEVOPS_PAT!,
-    project: 'Fidem'
+    project
   });
 
-  console.log('🔍 Analyzing Team-Area Name Matching Patterns\n');
+  console.log(`🔍 Analyzing Team-Area Name Matching Patterns for ${project}\n`);
   console.log('=' .repeat(70));
   
   try {
     // Fetch all areas and teams
     const [areas, teams] = await Promise.all([
-      client.getAreas('Fidem'),
-      client.getTeams('Fidem')
+      client.getAreas(project),
+      client.getTeams(project)
     ]);
     
     console.log(`\n📊 Data Overview:`);
@@ -276,7 +282,7 @@ async function analyzeTeamAreaMatching() {
     // Export mappings
     const mappingData = {
       timestamp: new Date().toISOString(),
-      project: 'Fidem',
+      project,
       statistics: {
         totalTeams: teams.value.length,
         totalAreas: areas.value.length,

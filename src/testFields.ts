@@ -16,8 +16,9 @@ async function testFields() {
     const connection = new azdev.WebApi(orgUrl, authHandler);
     
     // Test what fields are available in Areas for a specific project
-    console.log('1. Testing Areas fields with project scope...');
-    const projectUrl = `${analyticsUrl}/Fidem/_odata/v3.0-preview/Areas?$top=1`;
+    const project = process.env.AZURE_DEVOPS_PROJECT || 'YourProject';
+    console.log(`1. Testing Areas fields with project scope (${project})...`);
+    const projectUrl = `${analyticsUrl}/${project}/_odata/v3.0-preview/Areas?$top=1`;
     const projectResponse = await connection.rest.get(projectUrl);
     
     if (projectResponse.result) {
@@ -32,7 +33,7 @@ async function testFields() {
     
     // Test Teams fields
     console.log('\n2. Testing Teams fields...');
-    const teamsUrl = `${analyticsUrl}/Fidem/_odata/v3.0-preview/Teams?$top=1`;
+    const teamsUrl = `${analyticsUrl}/${project}/_odata/v3.0-preview/Teams?$top=1`;
     const teamsResponse = await connection.rest.get(teamsUrl);
     
     if (teamsResponse.result) {
@@ -47,7 +48,7 @@ async function testFields() {
     
     // Test WorkItemSnapshot fields
     console.log('\n3. Testing WorkItemSnapshot fields...');
-    const workItemsUrl = `${analyticsUrl}/Fidem/_odata/v3.0-preview/WorkItemSnapshot?$top=1`;
+    const workItemsUrl = `${analyticsUrl}/${project}/_odata/v3.0-preview/WorkItemSnapshot?$top=1`;
     const workItemsResponse = await connection.rest.get(workItemsUrl);
     
     if (workItemsResponse.result) {
