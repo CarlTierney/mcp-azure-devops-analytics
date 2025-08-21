@@ -208,6 +208,25 @@ export class AzureDevOpsClient {
     return relationships;
   }
 
+  private calculateDaysBetweenSK(startSK: number, endSK: number): number {
+    const startStr = startSK.toString();
+    const endStr = endSK.toString();
+    
+    const startDate = new Date(
+      parseInt(startStr.substring(0, 4)),
+      parseInt(startStr.substring(4, 6)) - 1,
+      parseInt(startStr.substring(6, 8))
+    );
+    
+    const endDate = new Date(
+      parseInt(endStr.substring(0, 4)),
+      parseInt(endStr.substring(4, 6)) - 1,
+      parseInt(endStr.substring(6, 8))
+    );
+    
+    return Math.floor((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24));
+  }
+
   async getIterations(project?: string, options?: { current?: boolean; timeframe?: 'past' | 'current' | 'future' }): Promise<any> {
     if (!project && !this.config.project) {
       // Aggregate from all projects
@@ -257,70 +276,74 @@ export class AzureDevOpsClient {
   async getWorkItemHistory(workItemId: number, project?: string): Promise<any> {
     const projectPath = project || this.config.project;
     
-    // Get all snapshots for a work item to see its history
-    const query = `WorkItemSnapshot?$select=WorkItemId,Revision,State,ChangedDateSK,AssignedToUserSK,AreaSK,IterationSK,Title` +
-                  `&$filter=WorkItemId eq ${workItemId}` +
-                  `&$orderby=Revision asc`;
+    // Use aggregation to get state distribution for a work item
+    // WorkItemSnapshot requires aggregation, so we group by state
+    const query = `WorkItemSnapshot?$apply=` +
+                  `filter(WorkItemId eq ${workItemId})/` +
+                  `groupby((State), ` +
+                  `aggregate($count as DaysInState, ` +
+                  `ChangedDateSK with min as FirstSeenDate, ` +
+                  `ChangedDateSK with max as LastSeenDate))` +
+                  `&$orderby=FirstSeenDate`;
     
     const snapshots = await this.queryAnalytics(query, projectPath);
     
     if (snapshots.value && snapshots.value.length > 0) {
-      // Calculate state transitions and cycle time
+      // Build history from aggregated state data
       const history: any = {
         workItemId,
-        totalRevisions: snapshots.value.length,
-        stateTransitions: [],
-        currentState: snapshots.value[snapshots.value.length - 1].State,
-        createdDate: snapshots.value[0].ChangedDateSK,
-        lastModifiedDate: snapshots.value[snapshots.value.length - 1].ChangedDateSK,
+        stateDistribution: snapshots.value,
+        totalDays: snapshots.value.reduce((sum: number, s: any) => sum + (s.DaysInState || 0), 0),
+        currentState: null,
         cycleTime: null,
         leadTime: null
       };
       
-      // Track state transitions
-      let previousState = null;
+      // Find the most recent state (highest LastSeenDate)
+      let mostRecentState = snapshots.value[0];
       let inProgressDate = null;
       let doneDate = null;
+      let createdDate = snapshots.value[0]?.FirstSeenDate;
       
-      for (const snapshot of snapshots.value) {
-        if (snapshot.State !== previousState) {
-          history.stateTransitions.push({
-            fromState: previousState,
-            toState: snapshot.State,
-            date: snapshot.ChangedDateSK,
-            revision: snapshot.Revision
-          });
-          
-          // Track key dates for cycle/lead time
-          if (snapshot.State === 'Active' || snapshot.State === 'In Progress') {
-            inProgressDate = snapshot.ChangedDateSK;
-          }
-          if (snapshot.State === 'Closed' || snapshot.State === 'Done' || snapshot.State === 'Resolved') {
-            doneDate = snapshot.ChangedDateSK;
-          }
-          
-          previousState = snapshot.State;
+      for (const state of snapshots.value) {
+        if (state.LastSeenDate > mostRecentState.LastSeenDate) {
+          mostRecentState = state;
+        }
+        
+        // Track key dates for cycle/lead time
+        if (state.State === 'Active' || state.State === 'In Progress') {
+          inProgressDate = state.FirstSeenDate;
+        }
+        if (state.State === 'Closed' || state.State === 'Done' || state.State === 'Resolved') {
+          doneDate = state.FirstSeenDate;
+        }
+        
+        // Find earliest date as created date
+        if (state.FirstSeenDate < createdDate) {
+          createdDate = state.FirstSeenDate;
         }
       }
       
+      history.currentState = mostRecentState.State;
+      history.createdDate = createdDate;
+      
       // Calculate cycle time (from In Progress to Done)
       if (inProgressDate && doneDate) {
-        const start = new Date(inProgressDate);
-        const end = new Date(doneDate);
-        history.cycleTime = Math.floor((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)); // Days
+        history.cycleTime = this.calculateDaysBetweenSK(inProgressDate, doneDate);
       }
       
-      // Calculate lead time (from Created to Done)
-      if (doneDate) {
-        const start = new Date(history.createdDate);
-        const end = new Date(doneDate);
-        history.leadTime = Math.floor((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)); // Days
+      // Calculate lead time (from Created to Done)  
+      if (createdDate && doneDate) {
+        history.leadTime = this.calculateDaysBetweenSK(createdDate, doneDate);
       }
       
       return history;
     }
     
-    return { error: 'Work item not found' };
+    return { 
+      error: 'Work item history not found',
+      workItemId
+    };
   }
 
   async getTeamMembers(teamName: string, project?: string): Promise<any> {

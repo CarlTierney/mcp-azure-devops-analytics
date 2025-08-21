@@ -7,6 +7,8 @@ import {
 import { AzureDevOpsClient, AzureDevOpsConfig } from './azureDevOpsClient.js';
 import { StorageManager } from './storageManager.js';
 import { MetricsAggregator } from './metricsAggregator.js';
+import { AnalyticsClient } from './analyticsClient.js';
+import { AdvancedAnalyticsClient } from './advancedAnalytics.js';
 import { HistoricalDataCollector } from './historicalDataCollector.js';
 import { DeploymentMetricsCollector } from './deploymentMetrics.js';
 import dotenv from 'dotenv';
@@ -26,6 +28,8 @@ if (!config.orgUrl || !config.pat) {
 }
 
 const client = new AzureDevOpsClient(config);
+const analyticsClient = new AnalyticsClient(client);
+const advancedAnalytics = new AdvancedAnalyticsClient(client);
 
 // Initialize storage and metrics
 const cacheDir = process.env.MCP_ANALYTICS_CACHE_DIR || '.mcp-analytics-cache';
@@ -541,6 +545,253 @@ const tools = [
       required: ['project', 'remainingWork'],
     },
   },
+  {
+    name: 'get_dashboard_metrics',
+    description: 'Get comprehensive dashboard metrics including velocity, cycle time, throughput, quality, DORA, and team health. Supports aggregation queries with filters like date ranges, states, and team names.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: {
+          type: 'string',
+          description: 'Project name to analyze',
+        },
+        teamName: {
+          type: 'string',
+          description: 'Optional team name for team-specific metrics',
+        },
+      },
+      required: ['project'],
+    },
+  },
+  {
+    name: 'get_work_item_trend',
+    description: 'Get work item count by state over time using aggregation. Supports filters: DateSK ranges, State, AreaPath, WorkItemType',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: {
+          type: 'string',
+          description: 'Project name',
+        },
+        days: {
+          type: 'number',
+          description: 'Number of days to look back (default: 30)',
+        },
+      },
+      required: ['project'],
+    },
+  },
+  {
+    name: 'get_burndown_data',
+    description: 'Get burndown chart data for a specific iteration using aggregation by DateSK and State',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: {
+          type: 'string',
+          description: 'Project name',
+        },
+        iterationPath: {
+          type: 'string',
+          description: 'Full iteration path',
+        },
+      },
+      required: ['project', 'iterationPath'],
+    },
+  },
+  {
+    name: 'get_cumulative_flow',
+    description: 'Get cumulative flow diagram data using aggregation. Groups by DateSK and State',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: {
+          type: 'string',
+          description: 'Project name',
+        },
+        days: {
+          type: 'number',
+          description: 'Number of days to include (default: 30)',
+        },
+      },
+      required: ['project'],
+    },
+  },
+  {
+    name: 'analyze_lead_time',
+    description: 'Analyze lead time with flexible filters (team, area, user, date range) across multiple periods',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: {
+          type: 'string',
+          description: 'Project name',
+        },
+        filter: {
+          type: 'object',
+          properties: {
+            teamName: { type: 'string' },
+            areaPath: { type: 'string' },
+            assignedTo: { type: 'string' },
+            workItemType: { type: 'string' },
+            state: { type: 'string' },
+            tags: { type: 'array', items: { type: 'string' } },
+            dateRange: {
+              type: 'object',
+              properties: {
+                start: { type: 'string', format: 'date' },
+                end: { type: 'string', format: 'date' },
+              },
+            },
+            iterationPath: { type: 'string' },
+          },
+        },
+      },
+      required: ['project'],
+    },
+  },
+  {
+    name: 'analyze_cycle_time',
+    description: 'Analyze cycle time with flexible filters across multiple periods with percentiles',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: {
+          type: 'string',
+          description: 'Project name',
+        },
+        filter: {
+          type: 'object',
+          properties: {
+            teamName: { type: 'string' },
+            areaPath: { type: 'string' },
+            assignedTo: { type: 'string' },
+            workItemType: { type: 'string' },
+            state: { type: 'string' },
+            tags: { type: 'array', items: { type: 'string' } },
+            dateRange: {
+              type: 'object',
+              properties: {
+                start: { type: 'string', format: 'date' },
+                end: { type: 'string', format: 'date' },
+              },
+            },
+          },
+        },
+      },
+      required: ['project'],
+    },
+  },
+  {
+    name: 'analyze_throughput',
+    description: 'Analyze throughput with baseline projection and spike detection, filterable by team/area/user',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: {
+          type: 'string',
+          description: 'Project name',
+        },
+        filter: {
+          type: 'object',
+          properties: {
+            teamName: { type: 'string' },
+            areaPath: { type: 'string' },
+            assignedTo: { type: 'string' },
+            workItemType: { type: 'string' },
+          },
+        },
+      },
+      required: ['project'],
+    },
+  },
+  {
+    name: 'analyze_failure_load',
+    description: 'Analyze failure load with calculated metrics (bug ratio, defect density, escape rate, MTTR)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: {
+          type: 'string',
+          description: 'Project name',
+        },
+        filter: {
+          type: 'object',
+          properties: {
+            teamName: { type: 'string' },
+            areaPath: { type: 'string' },
+            assignedTo: { type: 'string' },
+          },
+        },
+      },
+      required: ['project'],
+    },
+  },
+  {
+    name: 'analyze_card_age',
+    description: 'Analyze card age distribution with aging detection, filterable by type/team/area/user',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: {
+          type: 'string',
+          description: 'Project name',
+        },
+        filter: {
+          type: 'object',
+          properties: {
+            teamName: { type: 'string' },
+            areaPath: { type: 'string' },
+            assignedTo: { type: 'string' },
+            workItemType: { type: 'string' },
+            state: { type: 'string' },
+          },
+        },
+      },
+      required: ['project'],
+    },
+  },
+  {
+    name: 'analyze_backlog_growth',
+    description: 'Analyze backlog growth with spike detection and forecasting, filterable by team/area/type',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: {
+          type: 'string',
+          description: 'Project name',
+        },
+        filter: {
+          type: 'object',
+          properties: {
+            teamName: { type: 'string' },
+            areaPath: { type: 'string' },
+            workItemType: { type: 'string' },
+            tags: { type: 'array', items: { type: 'string' } },
+          },
+        },
+      },
+      required: ['project'],
+    },
+  },
+  {
+    name: 'query_analytics_aggregation',
+    description: 'Execute custom OData aggregation queries on Analytics API. Use $apply for aggregations with filter(), groupby(), and aggregate() functions. Example: "WorkItemSnapshot?$apply=filter(DateSK ge 20240101)/groupby((State), aggregate($count as Count))"',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'OData aggregation query with $apply syntax. Must use aggregation for Snapshot tables.',
+        },
+        project: {
+          type: 'string',
+          description: 'Project name for the query',
+        },
+      },
+      required: ['query', 'project'],
+    },
+  },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -888,6 +1139,181 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           args?.workUnit as 'points' | 'items',
           args?.teamName as string,
           args?.confidenceLevel as number
+        );
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case 'get_dashboard_metrics': {
+        const result = await analyticsClient.getDashboardMetrics(
+          args?.project as string,
+          args?.teamName as string
+        );
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case 'get_work_item_trend': {
+        const result = await analyticsClient.getWorkItemTrend(
+          args?.project as string,
+          args?.days as number || 30
+        );
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case 'get_burndown_data': {
+        const result = await analyticsClient.getBurndownData(
+          args?.project as string,
+          args?.iterationPath as string
+        );
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case 'get_cumulative_flow': {
+        const result = await analyticsClient.getCumulativeFlowData(
+          args?.project as string,
+          args?.days as number || 30
+        );
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case 'analyze_lead_time': {
+        const filter: any = args?.filter || {};
+        if (filter.dateRange) {
+          filter.dateRange.start = new Date(filter.dateRange.start);
+          filter.dateRange.end = new Date(filter.dateRange.end);
+        }
+        const result = await advancedAnalytics.analyzeLeadTime(
+          args?.project as string,
+          filter
+        );
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case 'analyze_cycle_time': {
+        const filter: any = args?.filter || {};
+        if (filter.dateRange) {
+          filter.dateRange.start = new Date(filter.dateRange.start);
+          filter.dateRange.end = new Date(filter.dateRange.end);
+        }
+        const result = await advancedAnalytics.analyzeCycleTime(
+          args?.project as string,
+          filter
+        );
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case 'analyze_throughput': {
+        const result = await advancedAnalytics.analyzeThroughput(
+          args?.project as string,
+          args?.filter || {}
+        );
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case 'analyze_failure_load': {
+        const result = await advancedAnalytics.analyzeFailureLoad(
+          args?.project as string,
+          args?.filter || {}
+        );
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case 'analyze_card_age': {
+        const result = await advancedAnalytics.analyzeCardAge(
+          args?.project as string,
+          args?.filter || {}
+        );
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case 'analyze_backlog_growth': {
+        const result = await advancedAnalytics.analyzeBacklogGrowth(
+          args?.project as string,
+          args?.filter || {}
+        );
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case 'query_analytics_aggregation': {
+        const result = await client.queryAnalytics(
+          args?.query as string,
+          args?.project as string
         );
         return {
           content: [
