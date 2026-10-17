@@ -11,6 +11,9 @@ import { AnalyticsClient } from './analyticsClient.js';
 import { AdvancedAnalyticsClient } from './advancedAnalytics.js';
 import { HistoricalDataCollector } from './historicalDataCollector.js';
 import { DeploymentMetricsCollector } from './deploymentMetrics.js';
+import { ContributionAnalyzer, compareToBenchmark } from './git/contribution.js';
+import { sdkRepoSource } from './git/repoSync.js';
+import { sdkPrSource } from './git/prSync.js';
 import dotenv from 'dotenv';
 import path from 'path';
 
@@ -39,6 +42,31 @@ storage.initialize().catch(console.error);
 const metricsAggregator = new MetricsAggregator(client, storage);
 const historicalCollector = new HistoricalDataCollector(client, storage);
 const deploymentCollector = new DeploymentMetricsCollector(client, storage);
+
+const splitList = (v?: string) => (v ? v.split(',').map((x) => x.trim()).filter(Boolean) : undefined);
+const contribution = new ContributionAnalyzer(
+  sdkRepoSource(client.getConnection()),
+  sdkPrSource(client.getConnection()),
+  {
+    cacheDir: path.resolve(cacheDir),
+    orgUrl: config.orgUrl,
+    pat: config.pat,
+    identityMapFile: process.env.IDENTITY_MAP_FILE,
+    benchmark: splitList(process.env.BENCHMARK_IDENTITY),
+    excludePaths: splitList(process.env.EXCLUDE_PATHS),
+    cloneConcurrency: process.env.GIT_CLONE_CONCURRENCY ? Number(process.env.GIT_CLONE_CONCURRENCY) : undefined,
+    reworkDays: process.env.REWORK_DAYS ? Number(process.env.REWORK_DAYS) : undefined,
+  }
+);
+
+function parseWindow(args: any) {
+  const until = args?.until ? new Date(args.until as string) : new Date();
+  const since = args?.since ? new Date(args.since as string) : new Date(until.getTime() - 90 * 86400000);
+  if (Number.isNaN(since.getTime()) || Number.isNaN(until.getTime()) || since >= until) {
+    throw new Error('Invalid date window. Use ISO dates (YYYY-MM-DD) with since before until.');
+  }
+  return { since, until };
+}
 
 const server = new Server(
   {
@@ -792,6 +820,52 @@ const tools = [
       required: ['query', 'project'],
     },
   },
+  {
+    name: 'sync_repositories',
+    description: 'Mirror-clone (first run) or fetch every Git repository in the organization into the local cache, including forks, empty and hidden repos, then pull pull-request metadata (reviewers, votes, comment threads). Returns a coverage report listing anything not covered and why. Needs a PAT with Code (Read). Run before the contribution tools and again to refresh.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string', description: 'Sync one project only. Default: all projects.' },
+        prSince: { type: 'string', description: 'Pull PRs created on or after this date (ISO). Default: 365 days ago.' },
+        includeIterations: { type: 'boolean', description: 'Also count push iterations per PR (one extra API call per PR). Default false.' },
+      },
+    },
+  },
+  {
+    name: 'get_coverage_report',
+    description: 'Coverage of the last repository sync: repos discovered, cloned, fetched, empty, disabled, failed (with reasons), plus commit and PR counts per repo.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'analyze_developer_contribution',
+    description: 'Per-developer change and pull request metrics from the local git mirrors plus cached PR metadata: commit frequency, active days and weeks, lines and files changed (generated and lock files excluded), rework, PR counts, PR size, time to first review and to complete, approvals, abandon rate, reviews given. Basis is landed work on each default branch.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        since: { type: 'string', description: 'Start date (ISO, e.g. 2026-07-01). Default: 90 days before until.' },
+        until: { type: 'string', description: 'End date (ISO). Default: now.' },
+        project: { type: 'string', description: 'Limit to one project. Default: all synced projects.' },
+        repository: { type: 'string', description: 'Limit to one repository (name or id).' },
+        developers: { type: 'array', items: { type: 'string' }, description: 'Emails or ADO unique names to include. Default: everyone.' },
+      },
+    },
+  },
+  {
+    name: 'compare_to_benchmark',
+    description: 'Compare each developer to the benchmark developer (BENCHMARK_IDENTITY env or the benchmark argument). Returns per-metric values, the benchmark value, the ratio and which direction is better, normalized per active week, plus a throughput index (1.0 = benchmark).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        since: { type: 'string', description: 'Start date (ISO, e.g. 2026-07-01). Default: 90 days before until.' },
+        until: { type: 'string', description: 'End date (ISO). Default: now.' },
+        project: { type: 'string', description: 'Limit to one project. Default: all synced projects.' },
+        repository: { type: 'string', description: 'Limit to one repository (name or id).' },
+        benchmark: { type: 'array', items: { type: 'string' }, description: 'Benchmark identities (emails / unique names). Overrides BENCHMARK_IDENTITY.' },
+        developers: { type: 'array', items: { type: 'string' }, description: 'Limit to these developers. Default: everyone.' },
+      },
+    },
+  },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -1323,6 +1397,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           ],
         };
+      }
+
+      case 'sync_repositories': {
+        const result = await contribution.sync({
+          project: args?.project as string | undefined,
+          prSince: args?.prSince ? new Date(args.prSince as string) : undefined,
+          includeIterations: args?.includeIterations === true,
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'get_coverage_report': {
+        const result = await contribution.coverage();
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'analyze_developer_contribution': {
+        const result = await contribution.analyze({
+          window: parseWindow(args),
+          project: args?.project as string | undefined,
+          repository: args?.repository as string | undefined,
+          developers: args?.developers as string[] | undefined,
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'compare_to_benchmark': {
+        const report = await contribution.analyze({
+          window: parseWindow(args),
+          project: args?.project as string | undefined,
+          repository: args?.repository as string | undefined,
+          developers: args?.developers as string[] | undefined,
+          benchmark: args?.benchmark as string[] | undefined,
+        });
+        const result = compareToBenchmark(report);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
       default:

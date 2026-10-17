@@ -1,0 +1,14 @@
+{
+  "identities": [
+    {
+      "canonical": "carl@example.com",
+      "displayName": "Carl Tierney",
+      "aliases": ["carl.tierney@work.example", "Carl.Tierney@contoso.com", "CarlT@users.noreply.github.com"]
+    },
+    {
+      "canonical": "dev.one@contoso.com",
+      "displayName": "Developer One",
+      "aliases": ["devone@old-domain.com"]
+    }
+  ]
+}

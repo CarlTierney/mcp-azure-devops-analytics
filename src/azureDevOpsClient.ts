@@ -21,6 +21,15 @@ export class AzureDevOpsClient {
     this.analyticsUrl = `https://analytics.dev.azure.com/${orgName}`;
   }
 
+  /** Underlying SDK connection, used by the git and pull request modules. */
+  getConnection(): azdev.WebApi {
+    return this.connection;
+  }
+
+  getConfig(): AzureDevOpsConfig {
+    return this.config;
+  }
+
   async queryAnalytics(query: string, project?: string): Promise<any> {
     const projectPath = project || this.config.project;
     

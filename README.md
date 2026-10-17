@@ -260,6 +260,54 @@ Parameters:
 - `query`: The OData query string
 - `project`: Optional specific project name to query
 
+## Developer Contribution Analytics (git based)
+
+These tools mirror every Git repository in the organization to local disk, compute change metrics from git history, and join them to pull request metadata from the Azure DevOps API. The goal is a rough but consistent view of each developer's contribution compared with a benchmark developer.
+
+### Tools
+
+| Tool | What it does |
+|------|--------------|
+| `sync_repositories` | Mirror clones every repo on the first run, fetches on later runs, then pulls PR metadata. Returns a coverage report. |
+| `get_coverage_report` | Coverage of the last sync: discovered, cloned, fetched, empty, disabled and failed repos with reasons. |
+| `analyze_developer_contribution` | Per-developer change and PR metrics for a date window. |
+| `compare_to_benchmark` | Each developer against the benchmark, per metric, with ratios and a throughput index. |
+
+### Configuration
+
+| Variable | Purpose |
+|----------|---------|
+| `AZURE_DEVOPS_PAT` | Needs Code (Read) in addition to Analytics (Read). |
+| `BENCHMARK_IDENTITY` | Comma-separated emails or ADO unique names for the benchmark developer. |
+| `IDENTITY_MAP_FILE` | Optional JSON mapping alternate emails to one person. See `identity-map.example.json`. |
+| `EXCLUDE_PATHS` | Optional comma-separated globs that replace the default generated-file exclusions. |
+| `GIT_CLONE_CONCURRENCY` | Parallel clones, default 6. |
+| `REWORK_DAYS` | Rework window, default 21. |
+
+Repos are stored as bare mirrors under `MCP_ANALYTICS_CACHE_DIR/repos`. The PAT is passed to git through environment config, so it never lands in a remote URL, `.git/config` or the process list. LFS content is not downloaded.
+
+### Coverage
+
+Every repo is cloned, including forks, hidden, empty and very large ones (large repos get a warning, not a skip). Disabled repos cannot be cloned in Azure DevOps and are listed as not covered. Commits that exist in both a fork and its parent are counted once.
+
+### How metrics are computed
+
+- Basis is landed work: commits reachable from each repo's default branch, merge commits excluded, filtered by author date.
+- Squash completions ("Merged PR N" with one parent) are credited to the PR author, not to whoever completed the PR.
+- Lines exclude lock files, minified files, build output, vendored code and designer or generated code.
+- Rates are per active week (a week with at least one commit), so part-time contributors are compared on intensity. `presencePct` shows how much of the window they were active.
+- Rework is lines a developer deleted from a file they changed within the rework window. It is an approximation, not line-level blame.
+- PR size comes from the local completion commit diffed against its first parent.
+- Time to first review is the first comment or vote by someone other than the author.
+- `completedWithoutApprovalPct` counts completed PRs with no approve or approve-with-suggestions vote from someone other than the author.
+- `throughputIndex` is the geometric mean of the commit, line and completed-PR rate ratios against the benchmark. 1.0 equals the benchmark.
+
+### Known limits
+
+- Rebased or force-pushed branches only show their final state.
+- Work that never lands on a default branch (abandoned PRs, long-lived branches) is not in the change metrics. It still shows in PR metrics.
+- Identity matching only merges exact email or unique name matches automatically. Same-name, different-email identities are listed in `dataNotes.possibleDuplicateIdentities` for you to add to the identity map.
+
 ## MCP Client Configuration
 
 To use this server with an MCP client (e.g., Claude Desktop), add the following to your MCP client configuration:
