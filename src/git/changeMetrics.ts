@@ -1,5 +1,6 @@
 import { CommitRecord, FileChange, AnalysisWindow } from './types.js';
 import { IdentityResolver } from './identity.js';
+import type { CommitSurvival } from './survival.js';
 
 /** Generated, vendored or lock files. Lines here say nothing about effort. Override with EXCLUDE_PATHS. */
 export const DEFAULT_EXCLUDES = [
@@ -58,6 +59,11 @@ export interface ChangeMetrics {
   /** Lines the same developer deleted from a file they changed within the rework window. Approximation, not blame. */
   reworkLines: number;
   reworkPct: number;
+  /** Share of added lines still attributed to the developer by blame at the survival horizon. */
+  survivalPct?: number;
+  survivalLinesMeasured: number;
+  /** Weeks with commits that fell under the minimum-activity threshold and were not counted as active. */
+  lightWeeksIgnored: number;
   firstCommit?: string;
   lastCommit?: string;
 }
@@ -69,6 +75,10 @@ export interface ChangeAnalysisOptions {
   reworkDays?: number;
   /** Commit SHA -> developer id override (e.g. squash commits credited to the PR author). */
   authorOverrides?: Map<string, string>;
+  /** Commit SHA -> survival counts from measureSurvival(). */
+  survival?: Map<string, CommitSurvival>;
+  /** A week counts as active only if the developer changed at least this many lines in it. Default 0. */
+  minActiveWeekLines?: number;
 }
 
 export interface ChangeAnalysisResult {
@@ -103,6 +113,7 @@ export function analyzeChanges(commits: CommitRecord[], opts: ChangeAnalysisOpti
     commits: number; days: Set<string>; weeks: Set<string>; repos: Set<string>;
     added: number; deleted: number; touches: number; files: Set<string>; excluded: number;
     perCommit: number[]; rework: number; first?: string; last?: string;
+    weekLines: Map<string, number>; survAdded: number; survived: number;
   }
   const acc = new Map<string, Acc>();
   const lastTouch = new Map<string, number>(); // dev|repo|path -> time
@@ -134,12 +145,17 @@ export function analyzeChanges(commits: CommitRecord[], opts: ChangeAnalysisOpti
     let a = acc.get(dev);
     if (!a) {
       a = { commits: 0, days: new Set(), weeks: new Set(), repos: new Set(), added: 0, deleted: 0,
-        touches: 0, files: new Set(), excluded: 0, perCommit: [], rework: 0 };
+        touches: 0, files: new Set(), excluded: 0, perCommit: [], rework: 0,
+        weekLines: new Map(), survAdded: 0, survived: 0 };
       acc.set(dev, a);
     }
     a.commits++;
     a.days.add(c.authorDate.slice(0, 10)); // author's local calendar day
-    a.weeks.add(isoWeek(c.authorDate));
+    const wk = isoWeek(c.authorDate);
+    a.weeks.add(wk);
+    a.weekLines.set(wk, (a.weekLines.get(wk) ?? 0) + commitLines);
+    const sv = opts.survival?.get(c.sha);
+    if (sv) { a.survAdded += sv.added; a.survived += sv.survived; }
     a.repos.add(c.repoId);
     for (const f of kept) {
       a.added += f.added;
@@ -154,14 +170,16 @@ export function analyzeChanges(commits: CommitRecord[], opts: ChangeAnalysisOpti
     a.last = c.authorDate;
   }
 
+  const minWeek = opts.minActiveWeekLines ?? 0;
   const developers: ChangeMetrics[] = [...acc.entries()].map(([dev, a]) => {
-    const weeks = a.weeks.size || 1;
+    const active = [...a.weekLines.values()].filter((n) => n >= minWeek).length;
+    const weeks = active || 1;
     return {
       developer: dev,
       displayName: opts.identity.displayName(dev),
       commits: a.commits,
       activeDays: a.days.size,
-      activeWeeks: a.weeks.size,
+      activeWeeks: active,
       reposTouched: a.repos.size,
       linesAdded: a.added,
       linesDeleted: a.deleted,
@@ -173,6 +191,9 @@ export function analyzeChanges(commits: CommitRecord[], opts: ChangeAnalysisOpti
       linesChangedPerActiveWeek: round((a.added + a.deleted) / weeks),
       reworkLines: a.rework,
       reworkPct: a.added ? round((a.rework / a.added) * 100) : 0,
+      survivalPct: a.survAdded ? round((a.survived / a.survAdded) * 100) : undefined,
+      survivalLinesMeasured: a.survAdded,
+      lightWeeksIgnored: a.weeks.size - active,
       firstCommit: a.first,
       lastCommit: a.last,
     };

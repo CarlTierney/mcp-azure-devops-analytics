@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import type * as azdev from 'azure-devops-node-api';
 import { runGit, mapWithConcurrency, scrub } from './gitRunner.js';
+import { withRetry } from './retry.js';
 import { Manifest, RepoInfo, RepoSyncResult } from './types.js';
 
 export interface RepoSyncOptions {
@@ -28,7 +29,7 @@ export function sdkRepoSource(connection: azdev.WebApi): RepoSource {
       const names: string[] = [];
       const page = 500;
       for (let skip = 0; ; skip += page) {
-        const batch = await core.getProjects(undefined, page, skip);
+        const batch = await withRetry(() => core.getProjects(undefined, page, skip));
         names.push(...batch.map((p) => p.name!).filter(Boolean));
         if (batch.length < page) break;
       }
@@ -37,7 +38,7 @@ export function sdkRepoSource(connection: azdev.WebApi): RepoSource {
     async listRepositories(project: string) {
       const git = await connection.getGitApi();
       // includeHidden = true so nothing is silently left out
-      const repos = await git.getRepositories(project, false, false, true);
+      const repos = await withRetry(() => git.getRepositories(project, false, false, true));
       return repos.map((r) => ({
         id: r.id!,
         name: r.name!,

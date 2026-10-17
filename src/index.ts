@@ -11,7 +11,7 @@ import { AnalyticsClient } from './analyticsClient.js';
 import { AdvancedAnalyticsClient } from './advancedAnalytics.js';
 import { HistoricalDataCollector } from './historicalDataCollector.js';
 import { DeploymentMetricsCollector } from './deploymentMetrics.js';
-import { ContributionAnalyzer, compareToBenchmark } from './git/contribution.js';
+import { ContributionAnalyzer, compareToBenchmark, comparePeriods } from './git/contribution.js';
 import { sdkRepoSource } from './git/repoSync.js';
 import { sdkPrSource } from './git/prSync.js';
 import dotenv from 'dotenv';
@@ -56,8 +56,38 @@ const contribution = new ContributionAnalyzer(
     excludePaths: splitList(process.env.EXCLUDE_PATHS),
     cloneConcurrency: process.env.GIT_CLONE_CONCURRENCY ? Number(process.env.GIT_CLONE_CONCURRENCY) : undefined,
     reworkDays: process.env.REWORK_DAYS ? Number(process.env.REWORK_DAYS) : undefined,
+    survivalDays: process.env.SURVIVAL_DAYS ? Number(process.env.SURVIVAL_DAYS) : undefined,
+    minActiveWeekLines: process.env.MIN_ACTIVE_WEEK_LINES ? Number(process.env.MIN_ACTIVE_WEEK_LINES) : undefined,
   }
 );
+
+function optDate(v: unknown, name: string): Date | undefined {
+  if (v === undefined || v === null || v === '') return undefined;
+  const d = new Date(String(v));
+  if (Number.isNaN(d.getTime())) throw new Error(`Invalid ${name}: ${v}. Use an ISO date (YYYY-MM-DD).`);
+  return d;
+}
+
+/** Window plus optional benchmark window and pivot, from args with env fallbacks. */
+function parsePeriods(args: any) {
+  const window = parseWindow(args);
+  const bSince = optDate(args?.benchmarkSince ?? process.env.BENCHMARK_SINCE, 'benchmarkSince');
+  const bUntil = optDate(args?.benchmarkUntil ?? process.env.BENCHMARK_UNTIL, 'benchmarkUntil');
+  const pivot = optDate(args?.pivot ?? process.env.PIVOT_DATE, 'pivot');
+  if (pivot && (pivot <= window.since || pivot >= window.until)) {
+    throw new Error('pivot must fall inside the since/until window.');
+  }
+  const benchmarkWindow = { since: bSince ?? window.since, until: bUntil ?? window.until };
+  if (benchmarkWindow.since >= benchmarkWindow.until) throw new Error('benchmarkSince must be before benchmarkUntil.');
+  return { window, benchmarkWindow, pivot, separateBenchmark: !!(bSince || bUntil) };
+}
+
+function splitAtPivot(window: { since: Date; until: Date }, pivot: Date) {
+  return {
+    before: { since: window.since, until: new Date(pivot.getTime() - 1) },
+    after: { since: pivot, until: window.until },
+  };
+}
 
 function parseWindow(args: any) {
   const until = args?.until ? new Date(args.until as string) : new Date();
@@ -848,12 +878,14 @@ const tools = [
         project: { type: 'string', description: 'Limit to one project. Default: all synced projects.' },
         repository: { type: 'string', description: 'Limit to one repository (name or id).' },
         developers: { type: 'array', items: { type: 'string' }, description: 'Emails or ADO unique names to include. Default: everyone.' },
+        pivot: { type: 'string', description: 'Split the window at this date (e.g. the date a team change happened) and report before and after separately. Env fallback: PIVOT_DATE.' },
+        survival: { type: 'boolean', description: 'Measure code survival with blame (default true). First run is slow on large orgs; results are cached.' },
       },
     },
   },
   {
     name: 'compare_to_benchmark',
-    description: 'Compare each developer to the benchmark developer (BENCHMARK_IDENTITY env or the benchmark argument). Returns per-metric values, the benchmark value, the ratio and which direction is better, normalized per active week, plus a throughput index (1.0 = benchmark).',
+    description: 'Compare each developer to the benchmark developer (BENCHMARK_IDENTITY env or the benchmark argument). Returns per-metric values, the benchmark value, the ratio and which direction is better, normalized per active week, plus a throughput index (1.0 = benchmark). The benchmark can come from its own window (benchmarkSince/benchmarkUntil), and a pivot date splits developers into before and after periods, each compared to the same benchmark.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -862,6 +894,10 @@ const tools = [
         project: { type: 'string', description: 'Limit to one project. Default: all synced projects.' },
         repository: { type: 'string', description: 'Limit to one repository (name or id).' },
         benchmark: { type: 'array', items: { type: 'string' }, description: 'Benchmark identities (emails / unique names). Overrides BENCHMARK_IDENTITY.' },
+        benchmarkSince: { type: 'string', description: 'Take the benchmark figures only from this date on (e.g. when the benchmark started coding). Env fallback: BENCHMARK_SINCE.' },
+        benchmarkUntil: { type: 'string', description: 'Benchmark window end. Env fallback: BENCHMARK_UNTIL.' },
+        pivot: { type: 'string', description: 'Split the window at this date (e.g. the date a team change happened) and report before and after separately. Env fallback: PIVOT_DATE.' },
+        survival: { type: 'boolean', description: 'Measure code survival with blame (default true). First run is slow on large orgs; results are cached.' },
         developers: { type: 'array', items: { type: 'string' }, description: 'Limit to these developers. Default: everyone.' },
       },
     },
@@ -1414,24 +1450,39 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'analyze_developer_contribution': {
-        const result = await contribution.analyze({
-          window: parseWindow(args),
+        const { window, pivot } = parsePeriods(args);
+        const scope = {
           project: args?.project as string | undefined,
           repository: args?.repository as string | undefined,
           developers: args?.developers as string[] | undefined,
-        });
+          survival: args?.survival !== false,
+        };
+        const result = pivot
+          ? await contribution.analyzePeriods({ ...scope, windows: splitAtPivot(window, pivot) })
+          : await contribution.analyze({ ...scope, window });
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
       case 'compare_to_benchmark': {
-        const report = await contribution.analyze({
-          window: parseWindow(args),
+        const { window, benchmarkWindow, pivot, separateBenchmark } = parsePeriods(args);
+        const scope = {
           project: args?.project as string | undefined,
           repository: args?.repository as string | undefined,
           developers: args?.developers as string[] | undefined,
           benchmark: args?.benchmark as string[] | undefined,
-        });
-        const result = compareToBenchmark(report);
+          survival: args?.survival !== false,
+        };
+        let result: unknown;
+        if (pivot) {
+          const { before, after } = splitAtPivot(window, pivot);
+          const r = await contribution.analyzePeriods({ ...scope, windows: { before, after, benchmark: benchmarkWindow } });
+          result = comparePeriods({ before: r.before, after: r.after }, r.benchmark);
+        } else if (separateBenchmark) {
+          const r = await contribution.analyzePeriods({ ...scope, windows: { window, benchmark: benchmarkWindow } });
+          result = compareToBenchmark(r.window, r.benchmark);
+        } else {
+          result = compareToBenchmark(await contribution.analyze({ ...scope, window }));
+        }
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 

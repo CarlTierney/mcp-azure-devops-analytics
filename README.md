@@ -283,6 +283,10 @@ These tools mirror every Git repository in the organization to local disk, compu
 | `EXCLUDE_PATHS` | Optional comma-separated globs that replace the default generated-file exclusions. |
 | `GIT_CLONE_CONCURRENCY` | Parallel clones, default 6. |
 | `REWORK_DAYS` | Rework window, default 21. |
+| `SURVIVAL_DAYS` | Days after landing at which code survival is measured, default 90. |
+| `MIN_ACTIVE_WEEK_LINES` | Lines changed for a week to count as active, default 20. |
+| `BENCHMARK_SINCE` / `BENCHMARK_UNTIL` | Default benchmark window, for example the date the benchmark developer started coding. |
+| `PIVOT_DATE` | Default date to split developers into before and after periods. |
 
 Repos are stored as bare mirrors under `MCP_ANALYTICS_CACHE_DIR/repos`. The PAT is passed to git through environment config, so it never lands in a remote URL, `.git/config` or the process list. LFS content is not downloaded.
 
@@ -295,12 +299,28 @@ Every repo is cloned, including forks, hidden, empty and very large ones (large 
 - Basis is landed work: commits reachable from each repo's default branch, merge commits excluded, filtered by author date.
 - Squash completions ("Merged PR N" with one parent) are credited to the PR author, not to whoever completed the PR.
 - Lines exclude lock files, minified files, build output, vendored code and designer or generated code.
-- Rates are per active week (a week with at least one commit), so part-time contributors are compared on intensity. `presencePct` shows how much of the window they were active.
+- Rates are per active week, so part-time contributors are compared on intensity. A week counts as active only if the developer changed at least `MIN_ACTIVE_WEEK_LINES` lines in it, so token commits don't dilute the rate. Ignored weeks show as `lightWeeksIgnored`. `presencePct` shows how much of the window they were active.
+- Code survival (`survivalPct`) is measured with `git blame -w -M` on the default branch as it stood `SURVIVAL_DAYS` after each commit landed. A fixed horizon keeps 2024 work and 2026 work comparable. Whitespace changes and moves within a file don't count as replacement. Files deleted or renamed by the horizon are left out rather than counted as dead. Commits younger than the horizon are not measured yet. Blame results are cached by revision and path, so only the first run is slow.
 - Rework is lines a developer deleted from a file they changed within the rework window. It is an approximation, not line-level blame.
 - PR size comes from the local completion commit diffed against its first parent.
 - Time to first review is the first comment or vote by someone other than the author.
 - `completedWithoutApprovalPct` counts completed PRs with no approve or approve-with-suggestions vote from someone other than the author.
+- The benchmark can come from its own window (`benchmarkSince` / `benchmarkUntil`). With a `pivot` date, developers are reported before and after the pivot, each period against the same benchmark, plus an `acrossPeriods` summary per developer.
 - `throughputIndex` is the geometric mean of the commit, line and completed-PR rate ratios against the benchmark. 1.0 equals the benchmark.
+
+### Example: benchmark from your own coding period
+
+```
+compare_to_benchmark
+  since: 2024-02-01
+  until: 2026-10-17
+  benchmarkSince: 2025-08-01
+  pivot: 2025-08-01
+```
+
+Run `sync_repositories` with `prSince` set to the start of the window first, or PR metrics will only cover the last 365 days.
+
+ADO API calls retry on 429 and transient 5xx responses with exponential backoff, honoring Retry-After.
 
 ### Known limits
 

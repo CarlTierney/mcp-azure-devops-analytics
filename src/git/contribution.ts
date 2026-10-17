@@ -7,6 +7,7 @@ import { analyzeChanges, ChangeMetrics, PathFilter, DEFAULT_EXCLUDES, round } fr
 import { analyzePullRequests, PrMetrics, prKey } from './prMetrics.js';
 import { IdentityResolver } from './identity.js';
 import { mapWithConcurrency } from './gitRunner.js';
+import { measureSurvival, CommitSurvival } from './survival.js';
 import { AnalysisWindow, CommitRecord, FileChange, PullRequestRecord, RepoSyncResult } from './types.js';
 
 export interface ContributionConfig {
@@ -18,6 +19,10 @@ export interface ContributionConfig {
   excludePaths?: string[];       // replaces DEFAULT_EXCLUDES when set
   cloneConcurrency?: number;
   reworkDays?: number;
+  /** Days after landing at which code survival is measured. Default 90. */
+  survivalDays?: number;
+  /** Minimum lines changed for a week to count as active. Default 20. */
+  minActiveWeekLines?: number;
 }
 
 export interface DeveloperContribution {
@@ -40,9 +45,36 @@ export interface ContributionReport {
     squashCommitsCreditedToPrAuthor: number;
     prsInWindow: number;
     prsWithSize: number;
+    survival: { horizonDays: number; enabled: boolean; blamesRun: number; blamesCached: number; filesMissingAtHorizon: number; commitsNotMatured: number };
+    minActiveWeekLines: number;
     possibleDuplicateIdentities: Array<{ name: string; ids: string[] }>;
     excludePatterns: string[];
   };
+}
+
+export interface AnalyzeParams {
+  project?: string;
+  repository?: string;
+  developers?: string[];
+  benchmark?: string[];
+  /** Measure code survival with blame. Default true. The first run on a large org is slow; results are cached. */
+  survival?: boolean;
+}
+
+interface LoadedData {
+  identity: IdentityResolver;
+  filter: PathFilter;
+  excludes: string[];
+  reworkDays: number;
+  commits: CommitRecord[];
+  prs: PullRequestRecord[];
+  prSizes: Map<string, FileChange[]>;
+  authorOverrides: Map<string, string>;
+  survival: Map<string, CommitSurvival>;
+  squashCredited: number;
+  reposAnalyzed: number;
+  skipped: Array<{ name: string; reason: string }>;
+  survivalStats: ContributionReport['dataNotes']['survival'];
 }
 
 export class ContributionAnalyzer {
@@ -88,14 +120,37 @@ export class ContributionAnalyzer {
     return buildCoverageReport(inv, prCounts);
   }
 
-  async analyze(params: {
-    window: AnalysisWindow; project?: string; repository?: string; developers?: string[]; benchmark?: string[];
-  }): Promise<ContributionReport> {
+  /** Single-window analysis. */
+  async analyze(params: AnalyzeParams & { window: AnalysisWindow }): Promise<ContributionReport> {
+    const out = await this.analyzePeriods({ ...params, windows: { window: params.window } });
+    return out.window;
+  }
+
+  /**
+   * Analyze several windows in one pass over the repos. Git history, PR sizes and blame results
+   * are loaded once for the union of all windows, then summarized per window.
+   */
+  async analyzePeriods(params: AnalyzeParams & { windows: Record<string, AnalysisWindow> }): Promise<Record<string, ContributionReport>> {
+    const windows = Object.values(params.windows);
+    if (!windows.length) throw new Error('At least one window is required.');
+    const union: AnalysisWindow = {
+      since: new Date(Math.min(...windows.map((w) => w.since.getTime()))),
+      until: new Date(Math.max(...windows.map((w) => w.until.getTime()))),
+    };
+    const data = await this.loadData(union, params);
+    const out: Record<string, ContributionReport> = {};
+    for (const [label, w] of Object.entries(params.windows)) out[label] = this.buildReport(data, w, params);
+    return out;
+  }
+
+  private async loadData(union: AnalysisWindow, params: AnalyzeParams): Promise<LoadedData> {
     const identity = await IdentityResolver.fromFile(this.cfg.identityMapFile);
     const excludes = this.cfg.excludePaths ?? DEFAULT_EXCLUDES;
     const filter = new PathFilter(excludes);
     const reworkDays = this.cfg.reworkDays ?? 21;
-    const lookback = new Date(params.window.since.getTime() - (reworkDays + 7) * 86400000);
+    const lookback = new Date(union.since.getTime() - (reworkDays + 7) * 86400000);
+    const survivalOn = params.survival !== false;
+    const horizonDays = this.cfg.survivalDays ?? 90;
 
     const inventory = await this.loadInventory();
     if (!inventory.length) throw new Error('No repositories synced yet. Run sync_repositories first.');
@@ -103,22 +158,21 @@ export class ContributionAnalyzer {
     const inScope = inventory.filter((r) =>
       (!params.project || eq(r.repo.project, params.project)) &&
       (!params.repository || eq(r.repo.name, params.repository) || r.repo.id === params.repository));
-    const skipped: Array<{ name: string; reason: string }> = [];
 
-    const allCommits: CommitRecord[] = [];
-    const allPrs: PullRequestRecord[] = [];
-    const prSizes = new Map<string, FileChange[]>();
-    const authorOverrides = new Map<string, string>();
-    let squashCredited = 0;
-    let analyzed = 0;
+    const data: LoadedData = {
+      identity, filter, excludes, reworkDays,
+      commits: [], prs: [], prSizes: new Map(), authorOverrides: new Map(), survival: new Map(),
+      squashCredited: 0, reposAnalyzed: 0, skipped: [],
+      survivalStats: { horizonDays, enabled: survivalOn, blamesRun: 0, blamesCached: 0, filesMissingAtHorizon: 0, commitsNotMatured: 0 },
+    };
 
     for (const r of inScope) {
       const label = `${r.repo.project}/${r.repo.name}`;
-      if (r.status === 'disabled' || r.status === 'failed') { skipped.push({ name: label, reason: r.error ?? r.status }); continue; }
+      if (r.status === 'disabled' || r.status === 'failed') { data.skipped.push({ name: label, reason: r.error ?? r.status }); continue; }
       if (r.status === 'empty' || !r.localPath) continue;
       const ref = await resolveDefaultRef(r.localPath, r.repo.defaultBranch);
-      if (!ref) { skipped.push({ name: label, reason: 'No default branch found' }); continue; }
-      analyzed++;
+      if (!ref) { data.skipped.push({ name: label, reason: 'No default branch found' }); continue; }
+      data.reposAnalyzed++;
 
       const commits = await readCommits(r.localPath, r.repo.id, { ref, since: lookback });
       const prs = await this.prSync.load(r.repo.id);
@@ -130,20 +184,41 @@ export class ContributionAnalyzer {
         const id = prIdFromSubject(c.subject);
         const pr = id !== undefined ? prById.get(id) : undefined;
         if (pr && c.parents.length === 1) {
-          authorOverrides.set(c.sha, identity.resolve(pr.createdBy.uniqueName || pr.createdBy.id, pr.createdBy.displayName));
-          squashCredited++;
+          data.authorOverrides.set(c.sha, identity.resolve(pr.createdBy.uniqueName || pr.createdBy.id, pr.createdBy.displayName));
+          data.squashCredited++;
         }
       }
-      allCommits.push(...commits);
+      data.commits.push(...commits);
 
-      const windowPrs = prs.filter((p) => inWindow(p.creationDate, params.window));
-      allPrs.push(...windowPrs);
-      const sizes = await this.prSizesFor(r.repo.id, r.localPath, windowPrs);
-      for (const [k, v] of sizes) prSizes.set(k, v);
+      if (survivalOn) {
+        const sv = await measureSurvival(r.localPath, ref, commits, {
+          horizonDays, pathFilter: filter, since: union.since,
+          cacheFile: path.join(this.cfg.cacheDir, 'blame', `${r.repo.id}-${horizonDays}d.json`),
+        });
+        for (const [sha, v] of sv.byCommit) data.survival.set(sha, v);
+        data.survivalStats.blamesRun += sv.blamesRun;
+        data.survivalStats.blamesCached += sv.blamesCached;
+        data.survivalStats.filesMissingAtHorizon += sv.filesMissingAtHorizon;
+        data.survivalStats.commitsNotMatured += sv.commitsNotMatured;
+      }
+
+      const unionPrs = prs.filter((p) => inWindow(p.creationDate, union));
+      data.prs.push(...unionPrs);
+      const sizes = await this.prSizesFor(r.repo.id, r.localPath, unionPrs);
+      for (const [k, v] of sizes) data.prSizes.set(k, v);
     }
+    return data;
+  }
 
-    const changes = analyzeChanges(allCommits, { window: params.window, identity, pathFilter: filter, reworkDays, authorOverrides });
-    const prMetrics = analyzePullRequests(allPrs, { window: params.window, identity, prSizes, pathFilter: filter });
+  private buildReport(data: LoadedData, window: AnalysisWindow, params: AnalyzeParams): ContributionReport {
+    const { identity } = data;
+    const minActiveWeekLines = this.cfg.minActiveWeekLines ?? 20;
+    const changes = analyzeChanges(data.commits, {
+      window, identity, pathFilter: data.filter, reworkDays: data.reworkDays,
+      authorOverrides: data.authorOverrides, survival: data.survival, minActiveWeekLines,
+    });
+    const windowPrs = data.prs.filter((p) => inWindow(p.creationDate, window));
+    const prMetrics = analyzePullRequests(windowPrs, { window, identity, prSizes: data.prSizes, pathFilter: data.filter });
 
     const benchmark = (params.benchmark?.length ? params.benchmark : this.cfg.benchmark) ?? [];
     const devIds = new Set<string>([...changes.developers.map((d) => d.developer), ...prMetrics.map((p) => p.developer)]);
@@ -162,22 +237,24 @@ export class ContributionAnalyzer {
 
     return {
       window: {
-        since: params.window.since.toISOString(),
-        until: params.window.until.toISOString(),
-        weeks: round((params.window.until.getTime() - params.window.since.getTime()) / (7 * 86400000)),
+        since: window.since.toISOString(),
+        until: window.until.toISOString(),
+        weeks: round((window.until.getTime() - window.since.getTime()) / (7 * 86400000)),
       },
-      scope: { project: params.project, repository: params.repository, reposAnalyzed: analyzed, reposSkipped: skipped },
+      scope: { project: params.project, repository: params.repository, reposAnalyzed: data.reposAnalyzed, reposSkipped: data.skipped },
       basis: 'Commits reachable from each repo\'s default branch (landed work), merges excluded, author date in window. PRs created in window.',
       developers,
       dataNotes: {
         commitsInWindow: changes.commitsInWindow,
         duplicateCommitsSkipped: changes.duplicateCommitsSkipped,
         excludedLinesTotal: changes.excludedLinesTotal,
-        squashCommitsCreditedToPrAuthor: squashCredited,
-        prsInWindow: allPrs.length,
-        prsWithSize: [...prSizes.keys()].length,
+        squashCommitsCreditedToPrAuthor: data.squashCredited,
+        prsInWindow: windowPrs.length,
+        prsWithSize: windowPrs.filter((p) => data.prSizes.has(prKey(p))).length,
+        survival: data.survivalStats,
+        minActiveWeekLines,
         possibleDuplicateIdentities: identity.possibleDuplicates(),
-        excludePatterns: excludes,
+        excludePatterns: data.excludes,
       },
     };
   }
@@ -233,6 +310,7 @@ export interface MetricComparison {
 
 export interface BenchmarkComparison {
   benchmark: { developer: string; displayName: string } | null;
+  benchmarkWindow: ContributionReport['window'];
   window: ContributionReport['window'];
   developers: Array<{
     developer: string;
@@ -258,6 +336,7 @@ const METRICS: MetricDef[] = [
   { metric: 'medianLinesPerCommit', betterWhen: 'context', get: (d) => d.changes?.medianLinesPerCommit ?? null },
   { metric: 'reposTouched', betterWhen: 'context', get: (d) => d.changes?.reposTouched ?? null },
   { metric: 'reworkPct', betterWhen: 'lower', get: (d) => d.changes?.reworkPct ?? null },
+  { metric: 'survivalPct', betterWhen: 'higher', get: (d) => d.changes?.survivalPct ?? null },
   { metric: 'prsCompletedPerActiveWeek', betterWhen: 'higher', get: (d) => perActiveWeek(d.pullRequests?.prsCompleted, d) },
   { metric: 'medianPrLines', betterWhen: 'lower', get: (d) => d.pullRequests?.medianPrLines ?? null },
   { metric: 'largePrPct', betterWhen: 'lower', get: (d) => {
@@ -276,9 +355,15 @@ const METRICS: MetricDef[] = [
   { metric: 'prsReviewedPerActiveWeek', betterWhen: 'higher', get: (d) => perActiveWeek(d.pullRequests?.prsReviewed, d) },
 ];
 
-export function compareToBenchmark(report: ContributionReport): BenchmarkComparison {
-  const bench = report.developers.find((d) => d.isBenchmark);
+/**
+ * Compare developers in `report` to the benchmark. By default the benchmark comes from the same
+ * report; pass `benchReport` to take the benchmark's figures from a different window (for
+ * example, only the period the benchmark was hands-on).
+ */
+export function compareToBenchmark(report: ContributionReport, benchReport?: ContributionReport): BenchmarkComparison {
+  const bench = (benchReport ?? report).developers.find((d) => d.isBenchmark);
   const w = report.window.weeks;
+  const bw = (benchReport ?? report).window.weeks;
   const notes: string[] = [];
   if (!bench) {
     notes.push('Benchmark developer not found in this window. Check BENCHMARK_IDENTITY and the identity map; ratios are null.');
@@ -287,7 +372,7 @@ export function compareToBenchmark(report: ContributionReport): BenchmarkCompari
   const developers = report.developers.filter((d) => !d.isBenchmark).map((d) => {
     const metrics = METRICS.map((m) => {
       const value = m.get(d, w);
-      const benchmark = bench ? m.get(bench, w) : null;
+      const benchmark = bench ? m.get(bench, bw) : null;
       return { metric: m.metric, value, benchmark, ratio: ratio(value, benchmark), betterWhen: m.betterWhen };
     });
     const pick = ['commitsPerActiveWeek', 'linesChangedPerActiveWeek', 'prsCompletedPerActiveWeek']
@@ -298,12 +383,58 @@ export function compareToBenchmark(report: ContributionReport): BenchmarkCompari
   }).sort((a, b) => (b.throughputIndex ?? -1) - (a.throughputIndex ?? -1));
 
   notes.push('Rates are per active week, so part-time or late-joining developers are compared on intensity; presencePct shows how much of the window they were active.');
-  notes.push('Lines exclude generated, vendored and lock files (see dataNotes.excludePatterns). Rework is a same-author, same-file approximation, not line-level blame.');
+  notes.push(`A week counts as active only with at least ${report.dataNotes.minActiveWeekLines} lines changed; lighter weeks are listed per developer as lightWeeksIgnored.`);
+  notes.push('Lines exclude generated, vendored and lock files (see dataNotes.excludePatterns). Rework is a same-author, same-file approximation. survivalPct is line-level blame at a fixed horizon after landing.');
   return {
     benchmark: bench ? { developer: bench.developer, displayName: bench.displayName } : null,
+    benchmarkWindow: (benchReport ?? report).window,
     window: report.window,
     developers,
     notes,
+  };
+}
+
+export interface PeriodComparison {
+  benchmark: { developer: string; displayName: string } | null;
+  benchmarkWindow: ContributionReport['window'];
+  periods: Record<string, BenchmarkComparison>;
+  /** Same developer across periods, each period against the same benchmark. */
+  acrossPeriods: Array<{
+    developer: string;
+    displayName: string;
+    byPeriod: Record<string, { activeWeeks: number; throughputIndex: number | null; survivalPct: number | null; reworkPct: number | null }>;
+  }>;
+  notes: string[];
+}
+
+export function comparePeriods(periods: Record<string, ContributionReport>, benchReport: ContributionReport): PeriodComparison {
+  const compared: Record<string, BenchmarkComparison> = {};
+  for (const [label, rep] of Object.entries(periods)) compared[label] = compareToBenchmark(rep, benchReport);
+
+  const ids = new Map<string, string>();
+  for (const c of Object.values(compared)) for (const d of c.developers) ids.set(d.developer, d.displayName);
+  const acrossPeriods = [...ids.entries()].map(([developer, displayName]) => {
+    const byPeriod: PeriodComparison['acrossPeriods'][number]['byPeriod'] = {};
+    for (const [label, c] of Object.entries(compared)) {
+      const d = c.developers.find((x) => x.developer === developer);
+      const val = (n: string) => d?.metrics.find((m) => m.metric === n)?.value ?? null;
+      byPeriod[label] = { activeWeeks: d?.activeWeeks ?? 0, throughputIndex: d?.throughputIndex ?? null,
+        survivalPct: val('survivalPct'), reworkPct: val('reworkPct') };
+    }
+    return { developer, displayName, byPeriod };
+  }).sort((a, b) => a.displayName.localeCompare(b.displayName));
+
+  const first = Object.values(compared)[0];
+  return {
+    benchmark: first?.benchmark ?? null,
+    benchmarkWindow: benchReport.window,
+    periods: compared,
+    acrossPeriods,
+    notes: [
+      'Every period is compared to the same benchmark window, so throughputIndex is comparable across periods.',
+      'A shift across periods is evidence, not attribution: team makeup, tooling and codebase state change over time.',
+      ...(first?.notes ?? []),
+    ],
   };
 }
 

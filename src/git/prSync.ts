@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import type * as azdev from 'azure-devops-node-api';
 import { mapWithConcurrency } from './gitRunner.js';
+import { withRetry } from './retry.js';
 import { PullRequestRecord, RepoInfo } from './types.js';
 
 /** Raw ADO thread shape we rely on (subset of GitPullRequestCommentThread). */
@@ -33,11 +34,11 @@ export function sdkPrSource(connection: azdev.WebApi): PrSource {
       const out: any[] = [];
       const top = 500;
       for (let skip = 0; ; skip += top) {
-        const batch = await git.getPullRequests(
+        const batch = await withRetry(() => git.getPullRequests(
           repo.id,
           { status: STATUS_ALL, minTime: since, queryTimeRangeType: RANGE_CREATED } as any,
           repo.project, undefined, skip, top
-        );
+        ));
         out.push(...batch);
         if (batch.length < top) break;
       }
@@ -45,11 +46,11 @@ export function sdkPrSource(connection: azdev.WebApi): PrSource {
     },
     async listThreads(repo, prId) {
       const git = await connection.getGitApi();
-      return (await git.getThreads(repo.id, prId, repo.project)) as RawThread[];
+      return (await withRetry(() => git.getThreads(repo.id, prId, repo.project))) as RawThread[];
     },
     async countIterations(repo, prId) {
       const git = await connection.getGitApi();
-      return (await git.getPullRequestIterations(repo.id, prId, repo.project, false)).length;
+      return (await withRetry(() => git.getPullRequestIterations(repo.id, prId, repo.project, false))).length;
     },
   };
 }
