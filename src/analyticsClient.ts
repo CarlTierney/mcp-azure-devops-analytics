@@ -34,16 +34,20 @@ export interface ThroughputMetrics {
 export interface QualityMetrics {
   bugRate: number;
   escapeRate: number;
-  reworkRate: number;
-  testCoverage: number;
-  codeReviewCoverage: number;
+  /** null until a real data source is wired in; use the git contribution tools for rework. */
+  reworkRate: number | null;
+  testCoverage: number | null;
+  codeReviewCoverage: number | null;
 }
 
 export interface DORAMetrics {
   deploymentFrequency: number;
-  leadTimeForChanges: number;
-  meanTimeToRestore: number;
-  changeFailureRate: number;
+  /** null: needs commit-to-deploy data, not available from work items. */
+  leadTimeForChanges: number | null;
+  /** null: needs incident data. */
+  meanTimeToRestore: number | null;
+  /** null: needs deployment failure data. */
+  changeFailureRate: number | null;
 }
 
 export interface TeamHealthMetrics {
@@ -80,9 +84,14 @@ export class AnalyticsClient {
    * Get velocity metrics for sprints
    */
   async getVelocityMetrics(project: string, teamName?: string): Promise<VelocityMetrics> {
+    // Pin to a single snapshot day. Filtering DateSK with "ge" sums one row per item per day,
+    // which multiplies story points by the number of days each item has been closed.
+    // Yesterday is used because today's snapshot may not be populated yet.
+    const snapshotDay = this.dateToSK(new Date(Date.now() - 24 * 60 * 60 * 1000));
+    const closedSince = this.dateToSK(new Date(Date.now() - 90 * 24 * 60 * 60 * 1000));
     const query = `WorkItemSnapshot?$apply=` +
-      `filter(DateSK ge ${this.dateToSK(new Date(Date.now() - 90 * 24 * 60 * 60 * 1000))}` +
-      ` and State eq 'Closed'` +
+      `filter(DateSK eq ${snapshotDay}` +
+      ` and State eq 'Closed' and ClosedDateSK ge ${closedSince}` +
       `${teamName ? ` and contains(AreaPath, '${teamName}')` : ''})/` +
       `groupby((IterationPath), aggregate(StoryPoints with sum as TotalPoints, $count as CompletedItems))` +
       `&$orderby=IterationPath desc`;
@@ -189,9 +198,9 @@ export class AnalyticsClient {
     return {
       bugRate: (totalBugs / totalItems) * 100,
       escapeRate: this.calculateEscapeRate(bugResult.value),
-      reworkRate: 0, // Would need revision data
-      testCoverage: 0, // Would need test data
-      codeReviewCoverage: 0 // Would need PR data
+      reworkRate: null, // Would need revision data
+      testCoverage: null, // Would need test data
+      codeReviewCoverage: null // Would need PR data
     };
   }
 
@@ -212,9 +221,9 @@ export class AnalyticsClient {
     
     return {
       deploymentFrequency: 30 / deploymentDays, // Deployments per day
-      leadTimeForChanges: 48, // Hours - would need commit to deploy data
-      meanTimeToRestore: 2, // Hours - would need incident data
-      changeFailureRate: 5 // Percentage - would need failure data
+      leadTimeForChanges: null, // Would need commit to deploy data
+      meanTimeToRestore: null, // Would need incident data
+      changeFailureRate: null // Would need failure data
     };
   }
 
